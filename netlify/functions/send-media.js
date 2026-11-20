@@ -1,64 +1,66 @@
-exports.handler = async function(event, context) {
-  const BOT_TOKEN = process.env.BOT_TOKEN;
-  // هنا بتحط الـ API Key بتاع خدمة التحميل اللي انت مشترك فيها
-  // مثال: const DOWNLOAD_API_KEY = process.env.DOWNLOAD_API_KEY;
-  // const DOWNLOAD_API_URL = process.env.DOWNLOAD_API_URL;
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const VIDEO_API_KEY = process.env.VIDEO_API_KEY; // حط هنا مفتاح videodownloadapi في Netlify
 
-  if (!BOT_TOKEN) {
-    return { statusCode: 500, body: JSON.stringify({ success: false, error: "Bot token not configured" }) };
-  }
+async function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-  try {
-    const { chatId, url, type, quality } = JSON.parse(event.body);
-    if (!chatId || !url || !type) {
-      return { statusCode: 400, body: JSON.stringify({ success: false, error: "Missing parameters" }) };
-    }
+exports.handler = async (event) => {
+  try{
+    const { url, format, quality, chatId } = JSON.parse(event.body || '{}');
+    if(!url || !chatId) return { statusCode:400, body: JSON.stringify({ok:false, error:'ناقص لينك او chatId'}) };
 
-    // ===== مكان ربط خدمة التحميل بتاعتك =====
-    // انت هنا هتعمل fetch لخدمة التحميل اللي معاك الـ Key بتاعها
-    // والخدمة دي هي اللي هترجعلك رابط ملف مباشر mp4 او mp3
-    // مثال للشكل اللي المفروض ترجعه الخدمة:
-    // const downloadRes = await fetch(DOWNLOAD_API_URL, { method:'POST', headers:{ Authorization: `Bearer ${DOWNLOAD_API_KEY}` }, body: JSON.stringify({ url, type, quality }) });
-    // const downloadData = await downloadRes.json();
-    // const fileUrl = downloadData.fileUrl; // رابط مباشر
-    // =========================================
+    const isAudio = format === 'audio';
 
-    // لو لسه مركبتش خدمة تحميل، هنبعت رسالة تأكيد مؤقتة عشان تتأكد ان الربط شغال
-    const fileUrl = null; // خليها null لحد ما تربط خدمتك، وبعدها حط fileUrl اللي جاي من الخدمة
+    // 1. ابدأ التحميل في videodownloadapi
+    const start = await fetch('https://videodownloadapi.com/api/v1/downloads', {
+      method:'POST',
+      headers:{
+        'Authorization': `Bearer ${VIDEO_API_KEY}`,
+        'Content-Type':'application/json'
+      },
+      body: JSON.stringify({
+        url,
+        format: isAudio ? 'MP3' : 'MP4',
+        quality: isAudio ? 'best' : quality
+      })
+    });
+    const startData = await start.json();
+    const download_id = startData.download_id || startData.id || startData.data?.download_id;
+    if(!download_id) return { statusCode:500, body: JSON.stringify({ok:false, error:'الـ API مردش بـ download_id: ' + JSON.stringify(startData).slice(0,300)}) };
 
-    if (fileUrl) {
-      // لو فيه ملف فعلي، ابعته كـ Document
-      const caption = type === 'video' ? `فيديو بجودة ${quality}p 🎬` : `صوت فقط 🎵`;
-      const sendRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendDocument`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, document: fileUrl, caption: caption })
+    // 2. استنى لحد ما يجهز - poll كل 3 ثواني لحد 3 دقايق
+    let download_url = null;
+    for(let i=0;i<60;i++){
+      await sleep(3000);
+      const check = await fetch(`https://videodownloadapi.com/api/v1/downloads/${download_id}`, {
+        headers:{ 'Authorization': `Bearer ${VIDEO_API_KEY}` }
       });
-      const sendData = await sendRes.json();
-      if (!sendRes.ok) {
-        return { statusCode: 500, body: JSON.stringify({ success: false, error: sendData.description || "Telegram API error" }) };
-      }
-    } else {
-      // وضع الاختبار: بيبعت رسالة تأكيد بس
-      const caption = type === 'video'
-        ? `تم استلام طلبك 🎬\nالرابط: ${url}\nالجودة: ${quality}p\n\nاربط خدمة التحميل في الـ Function عشان يوصلك الملف نفسه.`
-        : `تم استلام طلبك 🎵\nالرابط: ${url}\nالنوع: صوت فقط\n\nاربط خدمة التحميل في الـ Function عشان يوصلك الملف نفسه.`;
-
-      const sendRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: caption })
-      });
-      const sendData = await sendRes.json();
-      if (!sendRes.ok) {
-        return { statusCode: 500, body: JSON.stringify({ success: false, error: sendData.description || "Telegram API error" }) };
-      }
+      const j = await check.json();
+      const status = j.status || j.data?.status;
+      const fileUrl = j.download_url || j.data?.download_url;
+      if(status === 'ready' && fileUrl){ download_url = fileUrl; break; }
+      if(status === 'failed') return { statusCode:500, body: JSON.stringify({ok:false, error:'فشل التحميل من الـ API'}) };
     }
+    if(!download_url) return { statusCode:500, body: JSON.stringify({ok:false, error:'التحميل طول اكتر من اللازم'}) };
 
-    // بنرجع success عشان الصفحة تقفل لوحدها
-    return { statusCode: 200, body: JSON.stringify({ success: true }) };
+    // 3. نزل الملف وابعتو في تيليجرام كملف حقيقي مش لينك
+    const fileRes = await fetch(download_url);
+    const buffer = Buffer.from(await fileRes.arrayBuffer());
+    const filename = isAudio ? 'audio.mp3' : 'video.mp4';
 
-  } catch (error) {
-    return { statusCode: 500, body: JSON.stringify({ success: false, error: error.message }) };
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    form.append('caption', 'تم التحميل ✅');
+    form.append(isAudio ? 'audio' : 'video', new Blob([buffer], {type: isAudio ? 'audio/mpeg' : 'video/mp4'}), filename);
+
+    const tgRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${isAudio ? 'sendAudio' : 'sendVideo'}`, {
+      method:'POST',
+      body: form
+    });
+    const tgData = await tgRes.json();
+    if(!tgData.ok) return { statusCode:500, body: JSON.stringify({ok:false, error: tgData.description}) };
+
+    return { statusCode:200, body: JSON.stringify({ok:true}) };
+  }catch(e){
+    return { statusCode:500, body: JSON.stringify({ok:false, error: e.message}) };
   }
 };
